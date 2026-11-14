@@ -268,26 +268,29 @@ else
   OPENSSL_OPTIONS += -DOPENSSL_SMALL_FOOTPRINT
 endif
 
+# 只有显式选中对应引擎包时才打开，其余一律显式关闭。
+# wapp 只需要 libcrypto；devcrypto 引擎需要 crypto/cryptodev.h（由
+# cryptodev-linux 的 InstallDev 提供），默认打开会让整包编译失败。
 ifdef CONFIG_OPENSSL_ENGINE
   ifdef CONFIG_OPENSSL_ENGINE_BUILTIN
     OPENSSL_OPTIONS += disable-dynamic-engine
     ifndef CONFIG_OPENSSL_ENGINE_BUILTIN_AFALG
       OPENSSL_OPTIONS += no-afalgeng
     endif
-    ifdef CONFIG_OPENSSL_ENGINE_BUILTIN_DEVCRYPTO
-      OPENSSL_OPTIONS += enable-devcryptoeng
+    ifndef CONFIG_OPENSSL_ENGINE_BUILTIN_DEVCRYPTO
+      OPENSSL_OPTIONS += no-devcryptoeng
     endif
     ifndef CONFIG_OPENSSL_ENGINE_BUILTIN_PADLOCK
       OPENSSL_OPTIONS += no-hw-padlock
     endif
   else
-    ifdef CONFIG_PACKAGE_libopenssl-devcrypto
-      OPENSSL_OPTIONS += enable-devcryptoeng
+    ifndef CONFIG_PACKAGE_libopenssl1.1-devcrypto
+      OPENSSL_OPTIONS += no-devcryptoeng
     endif
-    ifndef CONFIG_PACKAGE_libopenssl-afalg
+    ifndef CONFIG_PACKAGE_libopenssl1.1-afalg
       OPENSSL_OPTIONS += no-afalgeng
     endif
-    ifndef CONFIG_PACKAGE_libopenssl-padlock
+    ifndef CONFIG_PACKAGE_libopenssl1.1-padlock
       OPENSSL_OPTIONS += no-hw-padlock
     endif
   endif
