@@ -1,6 +1,32 @@
 #!/bin/sh
+#
+# Hotplug entry point for wapp/bs20.
+#
+# Interface events are bursty: a wifi reload or a DHCP renew fires this script
+# several times in a row, and concurrent runs would killall each other's daemon.
+# Serialise them with a lock directory and drop overlapping events.
+#
 
-logger -t wapp-hotplug "INFO: hotplug trigger action=${ACTION:-unknown} interface=${INTERFACE:-unknown}, invoke /sbin/startwapp.sh"
+[ -x /sbin/startwapp.sh ] || exit 0
+[ -n "${ACTION:-}" ] || exit 0
+
+LOCK="/var/run/startwapp.lock"
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+	pid="$(cat "$LOCK/pid" 2>/dev/null)"
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		logger -t wapp-hotplug "INFO: startwapp.sh already running (pid $pid), skip action=${ACTION} interface=${INTERFACE:-?}"
+		exit 0
+	fi
+	# stale lock left behind by a killed run
+	rm -rf "$LOCK"
+	mkdir "$LOCK" 2>/dev/null || exit 0
+fi
+
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT INT TERM
+
+logger -t wapp-hotplug "INFO: hotplug trigger action=${ACTION} interface=${INTERFACE:-unknown}, invoke /sbin/startwapp.sh"
 
 /sbin/startwapp.sh
 rc=$?

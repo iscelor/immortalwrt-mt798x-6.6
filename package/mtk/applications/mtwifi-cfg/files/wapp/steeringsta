@@ -1,4 +1,13 @@
 #!/bin/sh
+#
+# 802.11v BSS Transition Management helper.
+#
+# Called by mt_wifi when a station drops below the per-BSS steering threshold
+# (`steeringthresold`). The BTM request itself is built and sent by wapp, this
+# script only validates the arguments and forwards the request.
+#
+# usage: steeringsta <ifname> <sta-mac>
+#
 
 LOG_TAG="wapp-steering"
 
@@ -10,25 +19,46 @@ log_e() {
 	logger -t "$LOG_TAG" "ERROR: $*"
 }
 
+ifname="$1"
 sta_mac="$2"
-if [ -z "$sta_mac" ]; then
-	log_e "missing station mac, args='$*'"
+
+if [ -z "$ifname" ] || [ -z "$sta_mac" ]; then
+	log_e "missing argument, usage: steeringsta <ifname> <sta-mac> (got '$*')"
 	exit 1
 fi
 
-log_i "request steering iface=$1 sta=$sta_mac"
-
-case "$1" in
-	"rax0")
-		wappctrl rax0 mbo steer_sta "$sta_mac"
-		rc=$?
-		[ "$rc" -eq 0 ] && log_i "steer success iface=rax0 sta=$sta_mac" || log_e "steer failed rc=$rc iface=rax0 sta=$sta_mac"
-		exit "$rc"
-	;;
-	*)
-		wappctrl ra0 mbo steer_sta "$sta_mac"
-		rc=$?
-		[ "$rc" -eq 0 ] && log_i "steer success iface=ra0 sta=$sta_mac" || log_e "steer failed rc=$rc iface=ra0 sta=$sta_mac"
-		exit "$rc"
-	;;
+case "$ifname" in
+	""|*[!0-9A-Za-z._-]*)
+		log_e "invalid interface name '$ifname'"
+		exit 1
+		;;
 esac
+
+case "$sta_mac" in
+	[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f])
+		;;
+	*)
+		log_e "invalid station mac '$sta_mac'"
+		exit 1
+		;;
+esac
+
+if ! pidof wapp >/dev/null 2>&1; then
+	log_e "wapp is not running, drop steering request iface=$ifname sta=$sta_mac"
+	exit 1
+fi
+
+log_i "steering iface=$ifname sta=$sta_mac"
+
+# wappctrl talks to wapp over netlink and blocks if wapp is wedged; never let a
+# dead daemon pin the kernel worker thread that runs us.
+timeout 3 wappctrl "$ifname" mbo steer_sta "$sta_mac"
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+	log_i "steer request sent iface=$ifname sta=$sta_mac"
+else
+	log_e "steer request failed rc=$rc iface=$ifname sta=$sta_mac"
+fi
+
+exit "$rc"

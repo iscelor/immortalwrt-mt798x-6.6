@@ -1,6 +1,21 @@
 #!/bin/sh
+#
+# Start wapp/bs20 when at least one radio actually needs them, then push the
+# 802.11v neighbour list down.
+#
+# Requirements are derived from the configuration instead of a single hardcoded
+# UCI section name, so 2.4G-only steering, MT7988 and renamed radios all work:
+#
+#   - wifi-device: wapp=1 or bandsteering=1
+#   - wifi-iface:  steeringthresold < 0, or ieee80211r=1
+#
+# The script is idempotent: a state file records the interfaces wapp was
+# started for, and a repeated hotplug event for an unchanged configuration
+# does not restart the daemon.
+#
 
 LOG_TAG="wapp"
+STATE_FILE="/var/run/wapp.state"
 
 log_i() {
     logger -t "$LOG_TAG" "INFO: $*"
@@ -28,142 +43,138 @@ run_bg() {
     log_i "started pid=$!: $*"
 }
 
-log_i "startwapp.sh start"
+# Band of a wifi-device, normalised to 2g/5g/6g.
+dev_band() {
+    local dev="$1" band hw
 
-run_cmd sh -c "killall bs20 2>/dev/null || true"
-run_cmd sh -c "killall wapp 2>/dev/null || true"
-br0_mac=$(cat /sys/class/net/br-lan/address)
-ctrlr_al_mac=$br0_mac
-agent_al_mac=$br0_mac
-ra0=0
-rax0=0
-
-log_i "bridge mac: ${br0_mac}"
-
-uci_get_default() {
-    local value
-    value="$(uci -q get "$1" 2>/dev/null)"
-    if [ -n "$value" ]; then
-        printf '%s' "$value"
-    else
-        printf '%s' "$2"
+    band="$(uci -q get wireless.$dev.band)"
+    if [ -z "$band" ]; then
+        hw="$(uci -q get wireless.$dev.hwmode)"
+        case "$hw" in
+            11a|11ac|11ax) band="5g" ;;
+            11g|11b|11bg) band="2g" ;;
+        esac
     fi
+
+    case "$band" in
+        2g|2.4g) echo "2g" ;;
+        5g) echo "5g" ;;
+        6g) echo "6g" ;;
+    esac
 }
 
-wapp_enabled=0
+log_i "startwapp.sh start"
+
+need_2g=0
+need_5g=0
+
 for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
-    dev_type="$(uci_get_default wireless.${dev}.type "")"
-    dev_wapp="$(uci_get_default wireless.${dev}.wapp 0)"
-    log_i "check device=${dev} type=${dev_type} wapp=${dev_wapp}"
-    [ "$dev_type" = "mtwifi" ] || continue
-    if [ "$(uci_get_default wireless.${dev}.wapp 0)" -eq "1" ]; then
-        wapp_enabled=1
-        break
-    fi
+    [ "$(uci -q get wireless.$dev.type)" = "mtwifi" ] || continue
+
+    band="$(dev_band "$dev")"
+    [ -n "$band" ] || continue
+
+    want=0
+    [ "$(uci -q get wireless.$dev.wapp)" = "1" ] && want=1
+    [ "$(uci -q get wireless.$dev.bandsteering)" = "1" ] && want=1
+
+    for iface in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+        [ "$(uci -q get wireless.$iface.device)" = "$dev" ] || continue
+
+        thres="$(uci -q get wireless.$iface.steeringthresold)"
+        case "$thres" in
+            ''|0) ;;
+            -*) want=1 ;;
+        esac
+
+        [ "$(uci -q get wireless.$iface.ieee80211r)" = "1" ] && want=1
+    done
+
+    [ "$want" = "1" ] || continue
+
+    case "$band" in
+        2g) need_2g=1 ;;
+        5g) need_5g=1 ;;
+        6g) log_i "radio $dev is 6GHz, wapp has no 6GHz control interface, ignored" ;;
+    esac
 done
 
-if [ "$wapp_enabled" -ne "1" ]; then
-    log_i "wapp switch disabled, exit"
+want_state="ra0=${need_2g} rax0=${need_5g}"
+log_i "requirements: $want_state"
+
+if [ "$need_2g" = "0" ] && [ "$need_5g" = "0" ]; then
+    log_i "no radio needs wapp, make sure it is stopped"
+    rm -f "$STATE_FILE"
+    killall bs20 2>/dev/null
+    killall wapp 2>/dev/null
     exit 0
 fi
 
-log_i "wapp switch enabled, continue"
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$want_state" ] && pidof wapp >/dev/null 2>&1; then
+    log_i "wapp already running with $want_state, nothing to do"
+    exit 0
+fi
+
+run_cmd sh -c "killall bs20 2>/dev/null || true"
+run_cmd sh -c "killall wapp 2>/dev/null || true"
+
+br0_mac="$(cat /sys/class/net/br-lan/address 2>/dev/null)"
+ctrlr_al_mac="$br0_mac"
+agent_al_mac="$br0_mac"
+
+log_i "bridge mac: ${br0_mac:-<none>}"
+
+if [ -n "$br0_mac" ] && [ -f /etc/map/1905d.cfg ]; then
+    run_cmd sed -i "s/map_controller_alid=.*/map_controller_alid=${ctrlr_al_mac}/g" /etc/map/1905d.cfg
+    run_cmd sed -i "s/map_agent_alid=.*/map_agent_alid=${agent_al_mac}/g" /etc/map/1905d.cfg
+fi
 
 sleep 2
 
-run_cmd sed -i "s/map_controller_alid=.*/map_controller_alid=${ctrlr_al_mac}/g" /etc/map/1905d.cfg
-run_cmd sed -i "s/map_agent_alid=.*/map_agent_alid=${agent_al_mac}/g" /etc/map/1905d.cfg
-
-    ra0_7981="$(uci_get_default wireless.MT7981_1_1.bandsteering 0)"
-    ra0_7986="$(uci_get_default wireless.MT7986_1_1.bandsteering 0)"
-    if [ "$ra0_7981" -eq "1" ] || [ "$ra0_7986" -eq "1" ]; then
-    ra0=1
-    rax0=1
-    fi
-    
-    ra0_7981="$(uci_get_default wireless.MT7981_1_1.ieee80211r 0)"
-    ra0_7986="$(uci_get_default wireless.MT7986_1_1.ieee80211r 0)"
-    if [ "$ra0_7981" -eq "1" ] || [ "$ra0_7986" -eq "1" ]; then
-    ra0=1
-    fi
-    
-    ra0_7981="$(uci_get_default wireless.default_MT7981_1_2.steeringthresold 0)"
-    ra0_7986="$(uci_get_default wireless.default_MT7986_1_2.steeringthresold 0)"
-    if [ "$ra0_7981" -lt "0" ] || [ "$ra0_7986" -lt "0" ]; then
-    ra0=1
-    fi
-        
-    ra0_7981="$(uci_get_default wireless.default_MT7981_1_1.disabled 0)"
-    ra0_7986="$(uci_get_default wireless.default_MT7986_1_1.disabled 0)"
-    if [ "$ra0_7981" -eq "1" ] || [ "$ra0_7986" -eq "1" ]; then
-    ra0=0
-    rax0=0
-    fi
-    
-    rax0_7981="$(uci_get_default wireless.MT7981_1_2.ieee80211r 0)"
-    rax0_7986="$(uci_get_default wireless.MT7986_1_2.ieee80211r 0)"
-    if [ "$rax0_7981" -eq "1" ] || [ "$rax0_7986" -eq "1" ]; then
-    rax0=1
-    fi
-   
-    rax0_7981="$(uci_get_default wireless.default_MT7981_1_2.steeringthresold 0)"
-    rax0_7986="$(uci_get_default wireless.default_MT7986_1_2.steeringthresold 0)"
-    if [ "$rax0_7981" -lt "0" ] || [ "$rax0_7986" -lt "0" ]; then
-    rax0=1
-    fi
-    
-    rax0_7981="$(uci_get_default wireless.default_MT7981_1_2.disabled 0)"
-    rax0_7986="$(uci_get_default wireless.default_MT7986_1_2.disabled 0)"
-    if [ "$rax0_7981" -eq "1" ] || [ "$rax0_7986" -eq "1" ]; then
-    rax0=0
-    fi
-
-    log_i "decision flags: ra0=${ra0}, rax0=${rax0}"
-     
-    if [ "$rax0" -eq "1" ] && [ "$ra0" -eq "1" ]  ; then
+if [ "$need_2g" = "1" ] && [ "$need_5g" = "1" ]; then
     run_bg wapp -d1 -v2 -cra0 -crax0
-    elif [ "$ra0" -eq "1" ] && [ "$rax0" -eq "0" ] ; then
+elif [ "$need_2g" = "1" ]; then
     run_bg wapp -d1 -v2 -cra0
-    elif [ "$rax0" -eq "1" ] && [ "$ra0" -eq "0" ] ; then
+else
     run_bg wapp -d1 -v2 -crax0
-    else
-    log_i "no interface requires wapp start"
-    fi
+fi
+
 sleep 1
-if [ "$rax0" -eq "1" ] || [ "$ra0" -eq "1" ]  ; then
-run_cmd iwpriv ra0 set mapR2Enable=0
-run_cmd iwpriv ra0 set mapTSEnable=0
-run_cmd iwpriv ra0 set mapR3Enable=0
-run_cmd iwpriv ra0 set DppEnable=0
-run_cmd iwpriv rax0 set mapR2Enable=0
-run_cmd iwpriv rax0 set mapTSEnable=0
-run_cmd iwpriv rax0 set mapR3Enable=0
-run_cmd iwpriv rax0 set DppEnable=0
-run_cmd iwpriv ra0 set mapEnable=2
-run_cmd iwpriv rax0 set mapEnable=2
+
+if ! pidof wapp >/dev/null 2>&1; then
+    log_e "wapp failed to start, is the mtwifi-wapp package selected in the image?"
+    rm -f "$STATE_FILE"
+    exit 1
+fi
+
+for dev in ra0 rax0; do
+    [ -d "/sys/class/net/$dev" ] || continue
+    run_cmd iwpriv "$dev" set mapR2Enable=0
+    run_cmd iwpriv "$dev" set mapTSEnable=0
+    run_cmd iwpriv "$dev" set mapR3Enable=0
+    run_cmd iwpriv "$dev" set DppEnable=0
+    run_cmd iwpriv "$dev" set mapEnable=2
+done
+
 run_bg bs20
-run_cmd wappctrl rax0 mbo reset_default
-run_cmd wappctrl ra0 mbo reset_default
-rax0_7981="$(uci -q get wireless.default_MT7981_1_2.steeringbssid 2>/dev/null)"
-rax0_7986="$(uci -q get wireless.default_MT7986_1_2.steeringbssid 2>/dev/null)"
-if [ -n "$rax0_7981" ]; then
-	run_cmd /sbin/setbssid rax0 "$rax0_7981"
-fi
 
-if [ -n "$rax0_7986" ]; then
-	run_cmd /sbin/setbssid rax0 "$rax0_7986"
-fi
+[ -d /sys/class/net/rax0 ] && run_cmd wappctrl rax0 mbo reset_default
+[ -d /sys/class/net/ra0 ] && run_cmd wappctrl ra0 mbo reset_default
 
-ra0_7981="$(uci -q get wireless.default_MT7981_1_1.steeringbssid 2>/dev/null)"
-ra0_7986="$(uci -q get wireless.default_MT7986_1_1.steeringbssid 2>/dev/null)"
-if [ -n "$ra0_7981" ]; then
-	run_cmd /sbin/setbssid ra0 "$ra0_7981"
-fi
+for iface in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+    bssid_list="$(uci -q get wireless.$iface.steeringbssid)"
+    [ -n "$bssid_list" ] || continue
 
-if [ -n "$ra0_7986" ]; then
-	run_cmd /sbin/setbssid ra0 "$ra0_7986"
-fi
+    case "$(dev_band "$(uci -q get wireless.$iface.device)")" in
+        2g) target=ra0 ;;
+        5g) target=rax0 ;;
+        *) continue ;;
+    esac
 
-fi
+    [ -d "/sys/class/net/$target" ] || continue
+    run_cmd /sbin/setbssid "$target" "$bssid_list"
+done
+
+echo "$want_state" > "$STATE_FILE"
 
 log_i "startwapp.sh done"

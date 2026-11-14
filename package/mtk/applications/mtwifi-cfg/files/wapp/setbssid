@@ -1,4 +1,13 @@
 #!/bin/sh
+#
+# Push the 802.11v neighbour list down to wapp: the candidate BSSIDs a client
+# may be steered to, plus the operating channel advertised by this interface.
+#
+# usage: setbssid <ifname> <mac>[/<mac>...]
+#
+# `uci get` returns a space separated UCI list while older LuCI builds stored
+# the value slash separated, accept both separators.
+#
 
 LOG_TAG="wapp-setbssid"
 
@@ -22,6 +31,25 @@ run_cmd() {
     return "$rc"
 }
 
+dev_band() {
+    local dev="$1" band hw
+
+    band="$(uci -q get wireless.$dev.band)"
+    if [ -z "$band" ]; then
+        hw="$(uci -q get wireless.$dev.hwmode)"
+        case "$hw" in
+            11a|11ac|11ax) band="5g" ;;
+            11g|11b|11bg) band="2g" ;;
+        esac
+    fi
+
+    case "$band" in
+        2g|2.4g) echo "2g" ;;
+        5g) echo "5g" ;;
+        6g) echo "6g" ;;
+    esac
+}
+
 iface="$1"
 bssid="$2"
 
@@ -30,36 +58,46 @@ if [ -z "$iface" ] || [ -z "$bssid" ]; then
     exit 1
 fi
 
-log_i "start setbssid iface=$iface bssid=$bssid"
-
-ra0_7981_channel="$(uci -q get wireless.MT7981_1_1.channel 2>/dev/null)"
-ra0_7986_channel="$(uci -q get wireless.MT7986_1_1.channel 2>/dev/null)"
-rax0_7981_channel="$(uci -q get wireless.MT7981_1_2.channel 2>/dev/null)"
-rax0_7986_channel="$(uci -q get wireless.MT7986_1_2.channel 2>/dev/null)"
-ra0_7981_channel="${ra0_7981_channel:-0}"
-ra0_7986_channel="${ra0_7986_channel:-0}"
-rax0_7981_channel="${rax0_7981_channel:-0}"
-rax0_7986_channel="${rax0_7986_channel:-0}"
-
-log_i "channels: ra0_7981=$ra0_7981_channel ra0_7986=$ra0_7986_channel rax0_7981=$rax0_7981_channel rax0_7986=$rax0_7986_channel"
-
-if [ "$ra0_7981_channel" -gt "0" ];then 
-    run_cmd wappctrl ra0 mbo nebor_op_ch "$ra0_7981_channel"
+if ! pidof wapp >/dev/null 2>&1; then
+    log_e "wapp is not running, cannot apply neighbour list on $iface"
+    exit 1
 fi
-if [ "$ra0_7986_channel" -gt "0" ];then 
-    run_cmd wappctrl ra0 mbo nebor_op_ch "$ra0_7986_channel"
-fi
-if [ "$rax0_7981_channel" -gt "0" ];then 
-    run_cmd wappctrl rax0 mbo nebor_op_ch "$rax0_7981_channel"
-fi
-if [ "$rax0_7986_channel" -gt "0" ];then
-    run_cmd wappctrl rax0 mbo nebor_op_ch "$rax0_7986_channel"
+
+# The band of the running interface decides which wifi-device channel to send.
+case "$iface" in
+    rax*) want_band="5g" ;;
+    *) want_band="2g" ;;
+esac
+
+channel=""
+for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+    [ "$(dev_band "$dev")" = "$want_band" ] || continue
+    chan="$(uci -q get wireless.$dev.channel)"
+    case "$chan" in
+        ''|0|auto) continue ;;
+    esac
+    channel="$chan"
+    break
+done
+
+if [ -n "$channel" ]; then
+    run_cmd wappctrl "$iface" mbo nebor_op_ch "$channel"
+else
+    log_i "no fixed channel for band $want_band, skip nebor_op_ch"
 fi
 
 OLD_IFS="$IFS"
-IFS='/'
+IFS=' /,'
 for var in $bssid; do
     [ -n "$var" ] || continue
+    case "$var" in
+        [0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f])
+            ;;
+        *)
+            log_e "skip invalid neighbour bssid '$var'"
+            continue
+            ;;
+    esac
     log_i "apply neighbor bssid=$var on iface=$iface"
     run_cmd wappctrl "$iface" mbo nebor_bssid "$var"
     run_cmd wappctrl "$iface" mbo add_test_nr "$var"
@@ -67,4 +105,3 @@ done
 IFS="$OLD_IFS"
 
 log_i "setbssid done"
-
