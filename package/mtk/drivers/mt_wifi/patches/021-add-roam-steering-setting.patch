@@ -34,11 +34,11 @@
 +
 +static DEFINE_SPINLOCK(mtk_steer_lock);
 +static struct mtk_steer_hist mtk_steer_hist[MTK_STEER_HISTORY];
-+static CHAR mtk_steer_path[] = "/sbin/steeringsta";
-+static CHAR mtk_steer_ifname[IFNAMSIZ];
-+static CHAR mtk_steer_mac[18];
-+static CHAR *mtk_steer_argv[] = { mtk_steer_path, mtk_steer_ifname, mtk_steer_mac, NULL };
-+static CHAR *mtk_steer_envp[] = { NULL };
++static char mtk_steer_path[] = "/sbin/steeringsta";
++static char mtk_steer_ifname[IFNAMSIZ];
++static char mtk_steer_mac[18];
++static char *mtk_steer_argv[] = { mtk_steer_path, mtk_steer_ifname, mtk_steer_mac, NULL };
++static char *mtk_steer_envp[] = { NULL };
 +static atomic_t mtk_steer_busy = ATOMIC_INIT(0);
 +
 +static BOOLEAN mtk_steer_addr_is_set(UCHAR *addr)
