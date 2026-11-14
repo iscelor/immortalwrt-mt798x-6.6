@@ -1,43 +1,163 @@
---- a/mt_wifi/embedded/ap/ap.c	2022-11-27 21:58:55.000000000 +0800
-+++ b/mt_wifi/embedded/ap/ap.c	2024-01-02 09:12:33.129403401 +0800
-@@ -2892,6 +2892,11 @@
+--- a/mt_wifi/embedded/ap/ap.c
++++ b/mt_wifi/embedded/ap/ap.c
+@@ -25,6 +25,8 @@
+ */
+ 
+ #include "rt_config.h"
++#include <linux/kmod.h>
++#include <linux/workqueue.h>
+ #define VLAN_HDR_LEN	4
+ #define MCAST_WCID_TO_REMOVE 0 /* Pat: TODO */
+ #ifdef TR181_SUPPORT
+@@ -2889,6 +2891,135 @@ static VOID tx_offload_counter_update(struct _RTMP_ADAPTER *ad, struct _MAC_TABL
+ 	==========================================================================
+ */
+ 
++/*
++ * 802.11v BSS transition steering.
++ *
++ * MacTableMaintenance() runs from the one second MLME timer, that is in
++ * softirq context. A helper process must not be spawned from there: the
++ * strings passed to call_usermodehelper() are only guaranteed to be valid
++ * for the duration of the call when the helper is started asynchronously,
++ * and exec from atomic context is not allowed either. Queue the request on
++ * the system workqueue instead and keep the helper strings in static
++ * storage that is only rewritten while no request is outstanding.
++ */
++#define MTK_STEER_COOLDOWN_SEC	30
++#define MTK_STEER_HISTORY	16
++
++struct mtk_steer_hist {
++	UCHAR addr[MAC_ADDR_LEN];
++	ULONG last;
++};
++
++static DEFINE_SPINLOCK(mtk_steer_lock);
++static struct mtk_steer_hist mtk_steer_hist[MTK_STEER_HISTORY];
++static CHAR mtk_steer_path[] = "/sbin/steeringsta";
++static CHAR mtk_steer_ifname[IFNAMSIZ];
++static CHAR mtk_steer_mac[18];
++static CHAR *mtk_steer_argv[] = { mtk_steer_path, mtk_steer_ifname, mtk_steer_mac, NULL };
++static CHAR *mtk_steer_envp[] = { NULL };
++static atomic_t mtk_steer_busy = ATOMIC_INIT(0);
++
++static BOOLEAN mtk_steer_addr_is_set(UCHAR *addr)
++{
++	int i;
++
++	for (i = 0; i < MAC_ADDR_LEN; i++) {
++		if (addr[i])
++			return TRUE;
++	}
++
++	return FALSE;
++}
++
++/* Steer a given station at most once per cooldown window. */
++static BOOLEAN mtk_steer_rate_ok(UCHAR *addr)
++{
++	unsigned long flags;
++	ULONG now = jiffies;
++	int i, slot = -1;
++	BOOLEAN allow = FALSE;
++
++	spin_lock_irqsave(&mtk_steer_lock, flags);
++
++	for (i = 0; i < MTK_STEER_HISTORY; i++) {
++		if (MAC_ADDR_EQUAL(mtk_steer_hist[i].addr, addr)) {
++			slot = i;
++			break;
++		}
++
++		if ((slot < 0) && !mtk_steer_addr_is_set(mtk_steer_hist[i].addr))
++			slot = i;
++	}
++
++	if (slot >= 0) {
++		if (!mtk_steer_addr_is_set(mtk_steer_hist[slot].addr) ||
++		    time_after(now, mtk_steer_hist[slot].last + MTK_STEER_COOLDOWN_SEC * HZ)) {
++			NdisMoveMemory(mtk_steer_hist[slot].addr, addr, MAC_ADDR_LEN);
++			mtk_steer_hist[slot].last = now;
++			allow = TRUE;
++		}
++	}
++
++	spin_unlock_irqrestore(&mtk_steer_lock, flags);
++
++	return allow;
++}
++
++static void mtk_steer_work_handler(struct work_struct *work)
++{
++	int ret;
++
++	ret = call_usermodehelper(mtk_steer_path, mtk_steer_argv, mtk_steer_envp,
++				  UMH_WAIT_EXEC);
++	if (ret)
++		pr_info_ratelimited("steeringsta: cannot execute helper (%d)\n", ret);
++
++	atomic_set(&mtk_steer_busy, 0);
++}
++
++static DECLARE_WORK(mtk_steer_work, mtk_steer_work_handler);
++
++VOID MtkSteerCancelWork(VOID)
++{
++	cancel_work_sync(&mtk_steer_work);
++}
++
++static void mtk_steer_request(RTMP_ADAPTER *pAd, MAC_TABLE_ENTRY *pEntry,
++			      BSS_STRUCT *pMbss, CHAR avgRssi)
++{
++	const char *ifname = NULL;
++	unsigned long flags;
++
++	if (!pEntry->wdev)
++		return;
++
++	/* One outstanding request is enough, the worker clears the flag. */
++	if (atomic_cmpxchg(&mtk_steer_busy, 0, 1) != 0)
++		return;
++
++	if (!mtk_steer_rate_ok(pEntry->Addr)) {
++		atomic_set(&mtk_steer_busy, 0);
++		return;
++	}
++
++	if (pEntry->wdev->if_dev)
++		ifname = RTMP_OS_NETDEV_GET_DEVNAME(pEntry->wdev->if_dev);
++
++	if (!ifname || !ifname[0])
++		ifname = WMODE_CAP_2G(pEntry->wdev->PhyMode) ? "ra0" : "rax0";
++
++	spin_lock_irqsave(&mtk_steer_lock, flags);
++	snprintf(mtk_steer_ifname, sizeof(mtk_steer_ifname), "%s", ifname);
++	snprintf(mtk_steer_mac, sizeof(mtk_steer_mac), MACSTR, MAC2STR(pEntry->Addr));
++	spin_unlock_irqrestore(&mtk_steer_lock, flags);
++
++	MTWF_DBG(pAd, DBG_CAT_AP, DBG_SUBCAT_ALL, DBG_LVL_INFO,
++		 "802.11v steer "MACSTR" via %s, RSSI %d < %d\n",
++		 MAC2STR(pEntry->Addr), ifname, avgRssi, pMbss->SteeringThreshold);
++
++	schedule_work(&mtk_steer_work);
++}
++
  VOID MacTableMaintenance(RTMP_ADAPTER *pAd)
  {
  	int wcid, startWcid, i;
-+	char path[20]={0};
-+	char arg1[6]={0};
-+	char arg2[24]={0};
-+	char *argv[]={path,arg1,arg2,NULL};
-+	char *envp[]={NULL};
- #ifdef DOT11_N_SUPPORT
- 	BOOLEAN	bRdgActive = FALSE;
- 	BOOLEAN bRalinkBurstMode;
-@@ -3963,6 +3968,24 @@
- 		}
+@@ -3964,6 +4095,11 @@ VOID MacTableMaintenance(RTMP_ADAPTER *pAd)
  
  		avgRssi = RTMPAvgRssi(pAd, &pEntry->RssiSample);
-+		
-+		if ( pEntry->RssiSample.Rssi_Updated && pMbss->SteeringThreshold &&
-+			(avgRssi < pMbss->SteeringThreshold)) {
-+			
-+			MTWF_DBG(pAd, DBG_CAT_AP, DBG_SUBCAT_ALL, DBG_LVL_NOTICE,
-+					 "Steering STA "MACSTR", RSSI SteeringThreshold Thres[%d]-[%d]\n",
-+					  MAC2STR(pEntry->Addr), pMbss->SteeringThreshold,	avgRssi);
-+					  
-+				if (WMODE_CAP_2G(pEntry->wdev->PhyMode)) {
-+				snprintf(argv[0], sizeof(path), "/sbin/steeringsta");
-+				snprintf(argv[1], sizeof(arg1), "ra0");
-+				snprintf(argv[2], sizeof(arg2), ""MACSTR"",MAC2STR(pEntry->Addr));}
-+				else {
-+				snprintf(argv[0], sizeof(path), "/sbin/steeringsta");
-+				snprintf(argv[1], sizeof(arg1), "rax0");
-+				snprintf(argv[2], sizeof(arg2), ""MACSTR"",MAC2STR(pEntry->Addr));}
-+				call_usermodehelper(path, argv, envp,UMH_NO_WAIT);
-+		}
  
++		if (pEntry->RssiSample.Rssi_Updated && pMbss->SteeringThreshold &&
++		    (avgRssi < pMbss->SteeringThreshold) &&
++		    IS_ENTRY_CLIENT(pEntry) && pEntry->wdev)
++			mtk_steer_request(pAd, pEntry, pMbss, avgRssi);
++
  		if ( pEntry->RssiSample.Rssi_Updated && pMbss->RssiLowForStaKickOut &&
  			(avgRssi < pMbss->RssiLowForStaKickOut)) {
-@@ -3984,6 +4007,7 @@
+ 			bDisconnectSta = TRUE;
+@@ -3984,6 +4120,7 @@ VOID MacTableMaintenance(RTMP_ADAPTER *pAd)
  					REASON_DEAUTH_STA_LEAVING);
  #endif
  		}
@@ -45,9 +165,9 @@
  
  		if (bDisconnectSta) {
  			/* send wireless event - for ageout */
---- a/mt_wifi/embedded/ap/ap_cfg.c	2022-11-27 21:58:55.000000000 +0800
-+++ b/mt_wifi/embedded/ap/ap_cfg.c	2024-01-01 00:53:22.132505954 +0800
-@@ -419,6 +419,7 @@
+--- a/mt_wifi/embedded/ap/ap_cfg.c
++++ b/mt_wifi/embedded/ap/ap_cfg.c
+@@ -419,6 +419,7 @@ INT Set_AP_PMKCachePeriod_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
  INT Set_AP_ASSOC_REQ_RSSI_THRESHOLD(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
  
  INT	Set_AP_KickStaRssiLow_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
@@ -55,7 +175,7 @@
  
  INT Set_BasicRate_Proc(RTMP_ADAPTER *pAd, RTMP_STRING *arg);
  
-@@ -1251,6 +1252,7 @@
+@@ -1251,6 +1252,7 @@ static struct {
  #endif /* SPECIFIC_TX_POWER_SUPPORT */
  	{"AssocReqRssiThres",           Set_AP_ASSOC_REQ_RSSI_THRESHOLD},
  	{"KickStaRssiLow",				Set_AP_KickStaRssiLow_Proc},
@@ -63,7 +183,7 @@
  	{"PtkRekey",					Set_PtkRekey_Proc},
  #ifdef OCE_SUPPORT
  	{"OceRssiThreshold",			Set_OceRssiThreshold_Proc},
-@@ -14528,6 +14530,16 @@
+@@ -14528,6 +14530,16 @@ INT Set_AP_ASSOC_REQ_RSSI_THRESHOLD(
  	TRUE if all parameters are OK, FALSE otherwise
      ==========================================================================
  */
@@ -80,11 +200,10 @@
  INT Set_AP_KickStaRssiLow_Proc(
  	IN  PRTMP_ADAPTER    pAd,
  	IN  RTMP_STRING *arg)
-@@ -14555,6 +14567,35 @@
- 
+@@ -14556,6 +14568,43 @@ INT Set_AP_KickStaRssiLow_Proc(
  	return TRUE;
  }
-+
+ 
 +
 +INT Set_AP_SteeringThreshold_Proc(
 +	IN  PRTMP_ADAPTER    pAd,
@@ -93,16 +212,24 @@
 +	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
 +	UCHAR           apidx = pObj->ioctl_if;
 +	UINT j;
++	LONG val;
 +	CHAR rssi;
 +
-+	rssi = os_str_tol(arg, 0, 10);
++	if (apidx >= pAd->ApCfg.BssidNum) {
++		MTWF_DBG(pAd, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_ERROR,
++			 "SteeringThreshold: invalid interface index %d\n", apidx);
++		return FALSE;
++	}
 +
-+	if (rssi == 0)
-+		MTWF_DBG(pAd, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_INFO, "Disable SteeringThreshold Function\n");
-+	else if (rssi > 0 || rssi < -100) {
++	val = os_str_tol(arg, 0, 10);
++	if (val > 0 || val < -100) {
 +		MTWF_DBG(pAd, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_ERROR, "SteeringThreshold Value Error.\n");
 +		return FALSE;
 +	}
++	rssi = (CHAR)val;
++
++	if (rssi == 0)
++		MTWF_DBG(pAd, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_INFO, "Disable SteeringThreshold Function\n");
 +
 +	pAd->ApCfg.MBSSID[apidx].SteeringThreshold = rssi;
 +	MTWF_DBG(pAd, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_INFO, "I/F(ra%d) SteeringThreshold=%d\n", apidx,
@@ -113,12 +240,13 @@
 +
 +	return TRUE;
 +}
- 
++
  /*
      ==========================================================================
---- a/mt_wifi/embedded/include/rtmp.h	2022-11-27 21:58:55.000000000 +0800
-+++ b/mt_wifi/embedded/include/rtmp.h	2024-01-01 01:04:57.047724405 +0800
-@@ -2971,6 +2971,7 @@
+     Description:
+--- a/mt_wifi/embedded/include/rtmp.h
++++ b/mt_wifi/embedded/include/rtmp.h
+@@ -2971,6 +2971,7 @@ typedef struct _BSS_STRUCT {
  	/* YF@20120417: Avoid connecting to AP in Poor Env, value 0 fOr disable. */
  	CHAR AssocReqRssiThreshold;
  	CHAR RssiLowForStaKickOut;
@@ -126,3 +254,19 @@
  
  #ifdef CUSTOMER_VENDOR_IE_SUPPORT
  	/*For AP vendor ie*/
+--- a/mt_wifi/os/linux/rt_linux.c
++++ b/mt_wifi/os/linux/rt_linux.c
+@@ -5685,9 +5685,13 @@ VOID os_module_init(VOID)
+ #endif
+ }
+ 
++/* 802.11v steering is queued from the MLME timer, drain it first */
++extern VOID MtkSteerCancelWork(VOID); /* embedded/ap/ap.c */
++
+ /*exit global data structrue for single driver*/
+ VOID os_module_exit(VOID)
+ {
++	MtkSteerCancelWork();
+ #ifdef CONFIG_6G_SUPPORT
+ 	bssmnger_deinit();
+ #endif
