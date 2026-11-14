@@ -69,7 +69,7 @@ call_usermodehelper(path, argv, envp, UMH_NO_WAIT);
 
 | 文件 | 改动 |
 |---|---|
-| `startwapp.sh` | 按配置**推导**是否需要 wapp（device 的 `wapp`/`bandsteering`，iface 的 `steeringthresold<0`/`ieee80211r`），不再依赖固定段名；按 `band` 决定 `-cra0`/`-crax0`；状态文件做幂等，配置没变就不重启 daemon；wapp 起不来时明确报错 |
+| `startwapp.sh` | 按配置**推导**是否需要 wapp（device 的 `wapp`/`bandsteering`，iface 的 `steeringthresold<0`；11r 走驱动侧 `FtSupport`，不触发 wapp），不再依赖固定段名；按 `band` 决定 `-cra0`/`-crax0`；状态文件做幂等，配置没变就不重启 daemon；wapp 起不来时明确报错 |
 | `100-startwapp` | 加锁目录串行化 hotplug 事件，重叠事件直接丢弃；清理陈旧锁 |
 | `steeringsta` | 校验接口名/MAC 格式；`pidof wapp` 预检；`timeout 3` 包裹 `wappctrl`，避免 daemon 卡死拖住内核 worker |
 | `setbssid` | 同时接受空格与 `/` 分隔；逐个校验 MAC；按接口所在频段选择要通告的信道，不再固定读 `MT7981_1_1`/`MT7986_1_1` |

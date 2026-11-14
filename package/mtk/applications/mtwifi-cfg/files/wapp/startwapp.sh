@@ -7,7 +7,11 @@
 # UCI section name, so 2.4G-only steering, MT7988 and renamed radios all work:
 #
 #   - wifi-device: wapp=1 or bandsteering=1
-#   - wifi-iface:  steeringthresold < 0, or ieee80211r=1
+#   - wifi-iface:  steeringthresold < 0
+#
+# 802.11r is deliberately not a trigger: it is mapped to the driver's FtSupport
+# by mtwifi_cfg and never goes through wapp, so starting the daemon for it would
+# only add a process and flip the radios into MAP mode for nothing.
 #
 # The script is idempotent: a state file records the interfaces wapp was
 # started for, and a repeated hotplug event for an unchanged configuration
@@ -86,8 +90,6 @@ for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/
             ''|0) ;;
             -*) want=1 ;;
         esac
-
-        [ "$(uci -q get wireless.$iface.ieee80211r)" = "1" ] && want=1
     done
 
     [ "$want" = "1" ] || continue
