@@ -24,7 +24,12 @@ else
 	uci -q set "turboacc.config.fastpath"="none"
 fi
 
-uci -q set "turboacc.config.fullcone"="2"
+# Only seed the default. This script runs on the first boot after every
+# sysupgrade, so an unconditional set silently overwrote the value an image
+# had already shipped: an AP image that disables full cone NAT came back as
+# Boardcom_FULLCONE_NAT after flashing.
+[ -n "$(uci -q get "turboacc.config.fullcone")" ] || \
+	uci -q set "turboacc.config.fullcone"="2"
 
 uci -q commit "turboacc"
 
