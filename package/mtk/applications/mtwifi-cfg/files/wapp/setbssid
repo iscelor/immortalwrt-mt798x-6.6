@@ -69,10 +69,16 @@ case "$iface" in
     *) want_band="2g" ;;
 esac
 
+# nebor_op_ch must be the channel the *candidate* AP runs on, not this
+# interface's own channel. Passing our own 149 made the driver look up
+# (bssid, 149) in its scan table, miss the target sitting on 36 and drop the
+# candidate entirely. The value now comes from the optional `steeringtargetch`
+# option; when it is absent nothing is pushed and the driver resolves the
+# channel from its own scan result.
 channel=""
-for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
-    [ "$(dev_band "$dev")" = "$want_band" ] || continue
-    chan="$(uci -q get wireless.$dev.channel)"
+for iface_s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+    [ "$(dev_band "$(uci -q get wireless.$iface_s.device)")" = "$want_band" ] || continue
+    chan="$(uci -q get wireless.$iface_s.steeringtargetch)"
     case "$chan" in
         ''|0|auto) continue ;;
     esac
@@ -83,7 +89,7 @@ done
 if [ -n "$channel" ]; then
     run_cmd wappctrl "$iface" mbo nebor_op_ch "$channel"
 else
-    log_i "no fixed channel for band $want_band, skip nebor_op_ch"
+    log_i "no steeringtargetch for band $want_band, let the driver resolve it"
 fi
 
 OLD_IFS="$IFS"

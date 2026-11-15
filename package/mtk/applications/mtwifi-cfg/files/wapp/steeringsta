@@ -43,20 +43,70 @@ case "$sta_mac" in
 		;;
 esac
 
-if ! pidof wapp >/dev/null 2>&1; then
-	log_e "wapp is not running, drop steering request iface=$ifname sta=$sta_mac"
-	exit 1
-fi
-
 log_i "steering iface=$ifname sta=$sta_mac"
 
-# wappctrl talks to wapp over netlink and blocks if wapp is wedged; never let a
-# dead daemon pin the kernel worker thread that runs us.
-timeout 3 wappctrl "$ifname" mbo steer_sta "$sta_mac"
+# The BTM frame is built and sent by the driver through an iwpriv ioctl instead
+# of wapp: wapp's "mbo steer_sta" only acknowledges the request without emitting
+# a frame, and its "btmreq" body differs per station (62 vs 80 bytes observed),
+# so some clients never received a candidate list. The ioctl returns
+# synchronously, hence no timeout wrapper (this image has no timeout command).
+#
+# Candidate BSSID / channel come from the same UCI options the LuCI page writes,
+# so changing them there keeps working without touching this script.
+
+find_section() {
+	local want="$1" dev band s
+	for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+		band="$(uci -q get wireless.$dev.band)"
+		if [ -z "$band" ]; then
+			case "$(uci -q get wireless.$dev.hwmode)" in
+				11a|11ac|11ax) band="5g" ;;
+				11g|11b|11bg) band="2g" ;;
+			esac
+		fi
+		[ "$band" = "$want" ] || continue
+		for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+			[ "$(uci -q get wireless.$s.device)" = "$dev" ] || continue
+			echo "$s"
+			return 0
+		done
+	done
+	return 1
+}
+
+case "$ifname" in
+	rax*) want_band="5g" ;;
+	*) want_band="2g" ;;
+esac
+
+section="$(find_section "$want_band")"
+cand_bssid=""
+cand_ch=""
+if [ -n "$section" ]; then
+	cand_bssid="$(uci -q get wireless.$section.steeringbssid | awk '{print $1}')"
+	cand_ch="$(uci -q get wireless.$section.steeringtargetch)"
+fi
+
+send_btm() {
+	local args="$sta_mac"
+	if [ -n "$cand_bssid" ]; then
+		args="$args,$cand_bssid"
+		[ -n "$cand_ch" ] && args="$args,$cand_ch"
+	fi
+	iwpriv "$ifname" set "BtmSteer=$args"
+}
+
+send_btm
 rc=$?
+if [ "$rc" -ne 0 ]; then
+	log_e "BtmSteer failed rc=$rc iface=$ifname sta=$sta_mac cand=${cand_bssid:-none}, retry once"
+	sleep 1
+	send_btm
+	rc=$?
+fi
 
 if [ "$rc" -eq 0 ]; then
-	log_i "steer request sent iface=$ifname sta=$sta_mac"
+	log_i "steer request sent iface=$ifname sta=$sta_mac cand=${cand_bssid:-none} ch=${cand_ch:-auto}"
 else
 	log_e "steer request failed rc=$rc iface=$ifname sta=$sta_mac"
 fi

@@ -112,13 +112,22 @@ if [ "$need_2g" = "0" ] && [ "$need_5g" = "0" ]; then
     exit 0
 fi
 
-if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$want_state" ] && pidof wapp >/dev/null 2>&1; then
-    log_i "wapp already running with $want_state, nothing to do"
+# pidof alone is not enough: wapp forks twice and can lose one instance while
+# still passing the check, after which every wappctrl call fails with rc=255.
+# Require the expected process count plus a responsive control socket.
+want_wapp=2
+have_wapp=$(pidof wapp 2>/dev/null | wc -w)
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$want_state" ] \
+   && [ "$have_wapp" -ge "$want_wapp" ] && [ -S /tmp/wapp_ctrl ]; then
+    log_i "wapp already running with $want_state ($have_wapp procs), nothing to do"
     exit 0
 fi
 
 run_cmd sh -c "killall bs20 2>/dev/null || true"
 run_cmd sh -c "killall wapp 2>/dev/null || true"
+# A killed wapp leaves its unix sockets behind, and a stale /tmp/wapp_ctrl makes
+# every later wappctrl fail with "Connect to server address fail".
+rm -f /tmp/wapp_ctrl /tmp/wapp_server
 
 br0_mac="$(cat /sys/class/net/br-lan/address 2>/dev/null)"
 ctrlr_al_mac="$br0_mac"
@@ -142,6 +151,18 @@ else
 fi
 
 sleep 1
+
+# Fixed delays are unreliable: 3s was measured to be too short while 10s always
+# worked. Wait for the control socket to actually appear.
+wait_i=0
+while [ "$wait_i" -lt 15 ]; do
+    [ -S /tmp/wapp_ctrl ] && break
+    sleep 1
+    wait_i=$((wait_i + 1))
+done
+if [ "$wait_i" -ge 15 ]; then
+    log_e "wapp control socket did not appear within 15s"
+fi
 
 if ! pidof wapp >/dev/null 2>&1; then
     log_e "wapp failed to start, is the mtwifi-wapp package selected in the image?"

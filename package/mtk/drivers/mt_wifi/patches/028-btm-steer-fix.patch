@@ -1,0 +1,244 @@
+diff -ruN mtwifi-base/mt_wifi/embedded/ap/ap_cfg.c mtwifi-work/mt_wifi/embedded/ap/ap_cfg.c
+--- a/mt_wifi/embedded/ap/ap_cfg.c	2026-11-15 14:12:35.043611600 +0800
++++ b/mt_wifi/embedded/ap/ap_cfg.c	2026-11-15 14:14:26.606436700 +0800
+@@ -1958,6 +1958,7 @@
+ #endif /* DOT11K_RRM_SUPPORT */
+ #ifdef CONFIG_DOT11V_WNM
+ 	{"SendBTMReq",					Set_SendBTMReq_Proc},
++	{"BtmSteer",					Set_BtmSteer_Proc},
+ #endif
+ 	{"RegDomain",					Set_Reg_Domain_Proc},
+ #ifdef DOT11N_DRAFT3
+@@ -26281,6 +26282,146 @@
+ 	return TRUE;
+ }
+ 
++/* ---- BtmSteer: a non-forced BTM Request carrying one candidate ---- */
++
++static UINT btm_steer_atoi(const char *s)
++{
++	UINT v = 0;
++
++	if (!s)
++		return 0;
++	while (*s >= '0' && *s <= '9') {
++		v = v * 10 + (UINT)(*s - '0');
++		s++;
++	}
++	return v;
++}
++
++static UCHAR btm_steer_hex(UCHAR c)
++{
++	if (c >= '0' && c <= '9')
++		return (UCHAR)(c - '0');
++	if (c >= 'a' && c <= 'f')
++		return (UCHAR)(c - 'a' + 10);
++	if (c >= 'A' && c <= 'F')
++		return (UCHAR)(c - 'A' + 10);
++	return 0xff;
++}
++
++static BOOLEAN btm_steer_parse_mac(const char *s, UCHAR *mac)
++{
++	INT i;
++	UCHAR hi, lo;
++
++	if (!s || strlen(s) != 17)
++		return FALSE;
++	for (i = 0; i < MAC_ADDR_LEN; i++) {
++		if (i < MAC_ADDR_LEN - 1 && s[i * 3 + 2] != ':')
++			return FALSE;
++		hi = btm_steer_hex((UCHAR)s[i * 3]);
++		lo = btm_steer_hex((UCHAR)s[i * 3 + 1]);
++		if (hi == 0xff || lo == 0xff)
++			return FALSE;
++		mac[i] = (UCHAR)((hi << 4) | lo);
++	}
++	return TRUE;
++}
++
++/*
++ * iwpriv rax0 set BtmSteer=<sta_mac>,<candidate_bssid>[,<channel>]
++ *
++ * The BTM body is built by the driver instead of wapp:
++ *   - request_mode = 0, i.e. a suggestion, not a forced disassociation
++ *   - one Neighbor Report candidate, so the client knows where to go
++ *   - channel is optional; when omitted compose_btm_req_ie resolves it from
++ *     the scan table
++ * wapp's "mbo steer_sta" never emits a frame and "btmreq" output differs per
++ * station, so neither is usable for automatic steering.
++ */
++INT Set_BtmSteer_Proc(PRTMP_ADAPTER pAd, RTMP_STRING *arg)
++{
++	POS_COOKIE pObj = (POS_COOKIE) pAd->OS_Cookie;
++	UCHAR ifIndex = pObj->ioctl_if;
++	UCHAR staAddr[MAC_ADDR_LEN];
++	UCHAR candAddr[MAC_ADDR_LEN];
++	btm_reqinfo_t *pInfo = NULL;
++	UCHAR *ieBuf = NULL;
++	UINT32 infoLen, ieLen = 0;
++	RTMP_STRING *tok;
++	INT idx;
++	BOOLEAN hasCand = FALSE;
++	MAC_TABLE_ENTRY *pEntry = NULL;
++	UINT ch = 0;
++
++	if (ifIndex >= pAd->ApCfg.BssidNum) {
++		MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_RRM, DBG_LVL_ERROR,
++			 "Unknown If index (%d)\n", ifIndex);
++		return FALSE;
++	}
++	if (!arg)
++		return FALSE;
++
++	NdisZeroMemory(staAddr, sizeof(staAddr));
++	NdisZeroMemory(candAddr, sizeof(candAddr));
++
++	idx = 0;
++	for (tok = rstrtok(arg, ","); tok && idx < 3;
++	     tok = rstrtok(NULL, ","), idx++) {
++		if (idx == 0) {
++			if (!btm_steer_parse_mac(tok, staAddr))
++				return FALSE;
++		} else if (idx == 1) {
++			if (!btm_steer_parse_mac(tok, candAddr))
++				return FALSE;
++			hasCand = TRUE;
++		} else {
++			ch = btm_steer_atoi(tok);
++		}
++	}
++	if (idx < 1)
++		return FALSE;
++
++	pEntry = MacTableLookup(pAd, staAddr);
++	if (!pEntry) {
++		MTWF_DBG(pAd, DBG_CAT_PROTO, CATPROTO_RRM, DBG_LVL_ERROR,
++			 "STA "MACSTR" not associated\n", MAC2STR(staAddr));
++		return FALSE;
++	}
++
++	infoLen = sizeof(btm_reqinfo_t) +
++		  (hasCand ? sizeof(struct nr_info) : 0);
++	os_alloc_mem(NULL, (UCHAR **)&pInfo, infoLen);
++	if (!pInfo)
++		return FALSE;
++	NdisZeroMemory(pInfo, infoLen);
++
++	COPY_MAC_ADDR(pInfo->sta_mac, staAddr);
++	pInfo->dialogtoken = 1;
++	pInfo->reqmode = 0;
++	pInfo->disassoc_timer = 0;
++	pInfo->valint = 200;
++	pInfo->num_candidates = hasCand ? 1 : 0;
++	if (hasCand) {
++		COPY_MAC_ADDR(pInfo->candidates[0].bssid, candAddr);
++		pInfo->candidates[0].channum = (UINT8)ch;
++		pInfo->candidates[0].preference = 1;
++	}
++
++	MlmeAllocateMemory(pAd, (PVOID)&ieBuf);
++	if (!ieBuf) {
++		os_free_mem(pInfo);
++		return FALSE;
++	}
++
++	compose_btm_req_ie(pAd, &pAd->ApCfg.MBSSID[ifIndex].wdev,
++			   ieBuf, &ieLen, pInfo, infoLen);
++	Send_BTM_Req(pAd, (RTMP_STRING *)staAddr, (RTMP_STRING *)ieBuf, ieLen);
++
++	MlmeFreeMemory(ieBuf);
++	os_free_mem(pInfo);
++	return TRUE;
++}
++
+ INT Send_BTM_Req(
+ 	IN PRTMP_ADAPTER pAd,
+ 	IN RTMP_STRING *PeerMACAddr,
+diff -ruN mtwifi-base/mt_wifi/embedded/common/wnm.c mtwifi-work/mt_wifi/embedded/common/wnm.c
+--- a/mt_wifi/embedded/common/wnm.c	2026-11-15 14:12:32.207260900 +0800
++++ b/mt_wifi/embedded/common/wnm.c	2026-11-15 14:14:05.365959500 +0800
+@@ -3138,14 +3138,60 @@
+ 		  */
+ 		if (nr_flag) {
+ 			BSS_TABLE *ScanTab = get_scan_tab_by_wdev(pAd, wdev);
++			ULONG idx2;
+ 
+ 			bss_index =
+ 				BssTableSearch(ScanTab, p_info->bssid, p_info->channum);
+ 			if (bss_index == BSS_NOT_FOUND) {
+-				MTWF_LOG(DBG_CAT_PROTO, CATPROTO_RRM, DBG_LVL_WARN,
+-					("%s() bss not found \n", __func__));
+-				continue;
++				/* The up-layer usually advertises its own operating
++				 * channel (nebor_op_ch) instead of the candidate's, so
++				 * the strict (bssid, channel) lookup misses even when the
++				 * target AP is present in the scan table. Retry by bssid.
++				 */
++				for (idx2 = 0; idx2 < ScanTab->BssNr; idx2++) {
++					if (MAC_ADDR_EQUAL(ScanTab->BssEntry[idx2].Bssid,
++							   p_info->bssid)) {
++						bss_index = idx2;
++						MTWF_LOG(DBG_CAT_PROTO, CATPROTO_RRM,
++							DBG_LVL_INFO,
++							("%s() ch %d mismatch, using scanned ch %d\n",
++							 __func__, p_info->channum,
++							 ScanTab->BssEntry[idx2].Channel));
++						p_info->channum =
++							ScanTab->BssEntry[idx2].Channel;
++						break;
++					}
++				}
+ 			}
++			if (bss_index == BSS_NOT_FOUND) {
++				/* Keep the candidate instead of dropping it: a BTM
++				 * Request without any candidate tells the client to
++				 * leave but not where to, and strict clients such as
++				 * Android simply ignore it.
++				 */
++				if (p_info->channum == 0) {
++					MTWF_LOG(DBG_CAT_PROTO, CATPROTO_RRM,
++						DBG_LVL_WARN,
++						("%s() no channel for "MACSTR", skipped\n",
++						 __func__, MAC2STR(p_info->bssid)));
++					continue;
++				}
++				MTWF_LOG(DBG_CAT_PROTO, CATPROTO_RRM, DBG_LVL_INFO,
++					("%s() "MACSTR" not in scan table, keep ch %d\n",
++					 __func__, MAC2STR(p_info->bssid),
++					 p_info->channum));
++				if (p_info->regclass == 0)
++					p_info->regclass =
++						(p_info->channum > 14) ? 115 : 81;
++				if (p_info->phytype == 0)
++					p_info->phytype = 7;
++				if (p_info->capinfo == 0)
++					p_info->capinfo = 0x0411;
++				if (p_info->is_ht == 0)
++					p_info->is_ht = 1;
++				if (p_info->ap_reachability == 0)
++					p_info->ap_reachability = 3;
++			} else {
+ 			pBssEntry = &ScanTab->BssEntry[bss_index];
+ 			if (p_info->regclass == 0)
+ 				p_info->regclass = pBssEntry->RegulatoryClass;
+@@ -3180,6 +3226,7 @@
+ 			}
+ 			if (p_info->phytype == 0)
+ 				p_info->phytype = pBssEntry->CondensedPhyType;
++			}
+ 		}
+ 
+ 		/*compose neighbor report ie buffer*/
+diff -ruN mtwifi-base/mt_wifi/embedded/include/wnm.h mtwifi-work/mt_wifi/embedded/include/wnm.h
+--- a/mt_wifi/embedded/include/wnm.h	2026-11-15 14:12:32.492497300 +0800
++++ b/mt_wifi/embedded/include/wnm.h	2026-11-15 14:14:26.609411300 +0800
+@@ -289,6 +289,7 @@
+ } BTM_REQ_FRAME, *PBTM_REQ_FRAME;
+ 
+ INT Set_SendBTMReq_Proc(PRTMP_ADAPTER pAd, RTMP_STRING *arg);
++INT Set_BtmSteer_Proc(PRTMP_ADAPTER pAd, RTMP_STRING *arg);
+ #endif
+ 
+ BOOLEAN IsGratuitousARP(IN PRTMP_ADAPTER pAd,

@@ -37,6 +37,7 @@ define Package/mtwifi-cfg/install
 
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/net/
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface/
+	$(INSTALL_DIR) $(1)/etc/init.d/
 	$(INSTALL_DIR) $(1)/etc/map/
 
 	$(INSTALL_BIN) ./files/netifd/mtwifi.sh $(1)/lib/netifd/wireless/
@@ -57,6 +58,8 @@ define Package/mtwifi-cfg/install
 	$(INSTALL_BIN) ./files/wapp/wappctrl $(1)/sbin/
 	$(INSTALL_BIN) ./files/wapp/setbssid $(1)/sbin/
 	$(INSTALL_BIN) ./files/wapp/steeringsta $(1)/sbin/
+	$(INSTALL_BIN) ./files/wapp/wapp-watchdog.sh $(1)/sbin/
+	$(INSTALL_BIN) ./files/wapp/wapp-watchdog.init $(1)/etc/init.d/wapp-watchdog
 	$(INSTALL_DATA) ./files/wapp/mapd_cfg $(1)/etc/map/
 	$(INSTALL_DATA) ./files/wapp/wapp_ap.conf $(1)/etc/
 	$(INSTALL_DATA) ./files/wapp/wapp_ap_ra0.conf $(1)/etc/
@@ -68,6 +71,7 @@ define Package/mtwifi-wapp/install
 	$(INSTALL_DIR) $(1)/usr/lib
 	$(INSTALL_DIR) $(1)/etc/map/
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface/
+	$(INSTALL_DIR) $(1)/etc/init.d/
 
 	$(INSTALL_BIN) ./files/wapp/libs/libcrypto.so.1.1 $(1)/usr/lib/
 	$(INSTALL_BIN) ./files/wapp/libs/libssl.so.1.1 $(1)/usr/lib/
@@ -78,6 +82,8 @@ define Package/mtwifi-wapp/install
 	$(INSTALL_BIN) ./files/wapp/wappctrl $(1)/sbin/
 	$(INSTALL_BIN) ./files/wapp/setbssid $(1)/sbin/
 	$(INSTALL_BIN) ./files/wapp/steeringsta $(1)/sbin/
+	$(INSTALL_BIN) ./files/wapp/wapp-watchdog.sh $(1)/sbin/
+	$(INSTALL_BIN) ./files/wapp/wapp-watchdog.init $(1)/etc/init.d/wapp-watchdog
 	$(INSTALL_DATA) ./files/wapp/mapd_cfg $(1)/etc/map/
 	$(INSTALL_DATA) ./files/wapp/wapp_ap.conf $(1)/etc/
 	$(INSTALL_DATA) ./files/wapp/wapp_ap_ra0.conf $(1)/etc/
