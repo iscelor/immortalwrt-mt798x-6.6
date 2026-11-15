@@ -1352,6 +1352,12 @@ return view.extend({
 					o.optional    = true;
 					o.placeholder = 0;
 					o.depends('mode', 'ap');
+
+					o = ss.taboption('advanced', form.Value, 'steeringtargetch', _('802.11V roam target channel'), _('channel of the candidate AP'));
+					o.optional    = true;
+					o.placeholder = 0;
+					o.datatype    = 'range(1,196)';
+					o.depends('mode', 'ap');
 					
 
 					o = ss.taboption('advanced', form.Value, 'assocthres', _('Station associate threshold'), _('dBm'));
